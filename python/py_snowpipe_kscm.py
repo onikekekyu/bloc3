@@ -24,15 +24,14 @@ from snowflake.ingest import SimpleIngestManager
 from snowflake.ingest import StagedFile
 from cryptography.hazmat.primitives import serialization
 
-# NOUVEAU: Importer les classes nécessaires depuis notre installation Kafka
 from simple_kafka_setup import broker, SimpleKafkaConsumer
+from data_quality import validate_dataset
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
 
 def connect_snow():
-    # ... (aucune modification dans cette fonction)
     private_key = "-----BEGIN PRIVATE KEY-----\n" + os.getenv("PRIVATE_KEY") + "\n-----END PRIVATE KEY-----\n"
     p_key = serialization.load_pem_private_key(
         bytes(private_key, 'utf-8'),
@@ -56,7 +55,6 @@ def connect_snow():
 
 
 def save_table_to_snowflake(snow, records, table_name, temp_dir, ingest_manager_factory):
-    # ... (aucune modification dans cette fonction)
     if not records:
         logging.info(f"No records to process for table {table_name}.")
         return
@@ -89,28 +87,31 @@ if __name__ == "__main__":
     temp_dir = tempfile.TemporaryDirectory()
     
     try:
-        # NOUVEAU: Initialiser le consommateur Kafka
         topic_name = os.getenv("KAFKA_TOPIC", "figurine_data_topic")
         consumer = SimpleKafkaConsumer(broker, consumer_id="snowflake_ingestor")
         consumer.subscribe(topic_name)
         logging.info(f"📡 Waiting for data on Kafka topic '{topic_name}'...")
-        
-        # NOUVEAU: Boucler en attendant un message
+
         message = None
         while not message:
-            message = consumer.poll(timeout=10.0) # Attendre 10 secondes
+            message = consumer.poll(timeout=10.0)
             if not message:
                 logging.info("... still waiting for message ...")
 
         logging.info("✅ Message received from Kafka, starting ingestion process.")
-        
-        # MODIFIÉ: Charger les données depuis le message Kafka au lieu de stdin
-        # unified_dataset = json.load(sys.stdin) # Ligne originale
-        unified_dataset = json.loads(message['data']) # Nouvelle ligne
-        
+
+        unified_dataset = json.loads(message['data'])
         logging.info("Successfully parsed JSON data from Kafka message.")
-        
-        # La suite du code reste identique
+
+        # Data quality validation before opening a Snowflake connection
+        dq_report = validate_dataset(unified_dataset)
+        if not dq_report["passed"]:
+            raise ValueError(
+                f"Data quality validation failed — "
+                f"{dq_report['summary']['error_count']} error(s). Ingestion aborted."
+            )
+        logging.info(f"Data quality passed — {dq_report['summary']}")
+
         snow = connect_snow()
         logging.info("Successfully connected to Snowflake.")
 
