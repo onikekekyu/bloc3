@@ -1,10 +1,10 @@
-# Terminal 1
+# Terminal 1 (from project root)
 """export KAFKA_TOPIC="figurine_data_topic"
-python py_snowpipe_kscm.py"""
+python python/py_snowpipe_kscm.py"""
 
-# Terminal 2
+# Terminal 2 (from project root)
 """export KAFKA_TOPIC="figurine_data_topic"
-python data_generator_kscm.py 20000 753 | python simple_publish_data.py"""
+python python/data_generator_kscm.py 20000 753 | python python/simple_publish_data.py"""
 
 
 import os

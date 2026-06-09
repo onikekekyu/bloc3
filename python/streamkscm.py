@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from datetime import datetime
@@ -290,7 +291,7 @@ def main():
         return
 
     # --- Sidebar ---
-    st.sidebar.image("shrek.png", width=80)
+    st.sidebar.image(str(Path(__file__).parent.parent / "shrek.png"), width=80)
     st.sidebar.title("👑 Filtres du Dashboard")
 
     # Get Anthropic API key from .env or allow override

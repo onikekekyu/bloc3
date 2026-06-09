@@ -29,3 +29,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# File-based Kafka broker storage
+kafka_topics/

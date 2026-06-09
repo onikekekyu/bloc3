@@ -1,499 +1,160 @@
-# Snowflake Data Ingestion Pipeline Guide
+# KSCM Figurine — Data Pipeline
 
-This guide will help you set up a complete data ingestion pipeline that generates sample e-commerce data and loads it into Snowflake using Python and key pair authentication.
+End-to-end real-time data pipeline for the KSCM figurine business: synthetic data generation → message queue → Snowflake ingestion via Snowpipe → Business Intelligence dashboard.
 
-## 🎯 What You'll Build
+![Pipeline Architecture](use_case_pipeline.png)
 
-- **Data Generator**: Creates realistic customer order data for "Kpop Demon Hunter" merchandise
-- **Snowflake Integration**: Secure connection using RSA key pair authentication  
-- **Python Pipeline**: Stream processing from data generator directly to Snowflake
-- **Sample Dataset**: 100,000 compressed records for testing and development
+## Architecture
 
-## 📋 Prerequisites
-
-- **Snowflake Account**: Access to a Snowflake account with ACCOUNTADMIN privileges
-- **Python**: Python 3.8+ (we'll use conda to manage this)
-- **Command Line**: Terminal (Mac) or PowerShell/Command Prompt (Windows)
-
-## 🚀 Step 1: Install Conda
-
-### For Mac:
-1. Download [Miniconda](https://docs.conda.io/en/latest/miniconda.html) for macOS
-2. Install and initialize:
-   ```bash
-   bash Miniconda3-latest-MacOSX-arm64.sh  # For Apple Silicon
-   # OR
-   bash Miniconda3-latest-MacOSX-x86_64.sh  # For Intel Mac
-   
-   # Initialize conda
-   conda init zsh  # or bash if you use bash
-   ```
-3. Restart your terminal
-
-### For Windows:
-1. Download [Miniconda](https://docs.conda.io/en/latest/miniconda.html) for Windows
-2. Install using the installer (choose "Add conda to PATH" option)
-3. Open a new PowerShell or Command Prompt
-
-## 📁 Step 2: Create Project Directory
-
-### Mac:
-```bash
-mkdir ~/Desktop/snowflake-ingestion
-cd ~/Desktop/snowflake-ingestion
+```
+data_generator_kscm.py
+        │  JSON (4 tables)
+        ▼
+simple_publish_data.py  ──►  File-based Kafka broker  ──►  py_snowpipe_kscm.py
+                                (kafka_topics/)                      │
+                                                              Snowpipe (async)
+                                                                     │
+                                                              Snowflake (FIGURINE_DB)
+                                                             ┌───────┴────────┐
+                                                          PRODUCTS        CUSTOMERS
+                                                          ORDERS       ORDER_ITEMS
+                                                                     │
+                                                              streamkscm.py
+                                                           (Streamlit dashboard)
 ```
 
-### Windows:
-```powershell
-mkdir $HOME\Desktop\snowflake-ingestion
-cd $HOME\Desktop\snowflake-ingestion
+**Tech stack:** Python · File-based message queue · Snowflake + Snowpipe · Streamlit · Anthropic Claude API
+
+## Project Structure
+
+```
+bloc3/
+├── sql/
+│   └── setup_snowflake.sql      # Snowflake DDL: warehouse, roles, tables, stages, pipes
+├── python/
+│   ├── data_generator_kscm.py   # Generates synthetic products / customers / orders
+│   ├── simple_kafka_setup.py    # File-based message broker (Kafka-like, no external deps)
+│   ├── simple_publish_data.py   # Producer: stdin → broker topic
+│   ├── simple_consume_data.py   # Consumer (test/debug)
+│   ├── py_snowpipe_kscm.py      # Ingestor: broker → Parquet → Snowpipe → Snowflake
+│   └── streamkscm.py            # Streamlit BI dashboard
+├── tests/
+│   ├── conftest.py              # sys.path setup for pytest
+│   └── test_data_generator.py  # Unit tests for the data generator
+├── screenshots/                 # Dashboard screenshots
+├── .env.example                 # Environment variable template
+├── requirements.txt
+└── README.md
 ```
 
-## 🐍 Step 3: Set Up Python Environment
+## Data Model
 
-Create the `environment.yml` file:
+| Table | Description |
+|---|---|
+| `PRODUCTS` | Master catalog — model, theme, finish, price, SKU |
+| `CUSTOMERS` | Registered buyers |
+| `ORDERS` | Transactions with channel (online / in_person) and status |
+| `ORDER_ITEMS` | Line items linking orders to products with quantity and price |
 
-```yaml
-name: sf-ingest-examples
-channels:
-  - main
-  - conda-forge
-  - defaults
-dependencies:
-  - faker=28.4.1
-  - kafka-python=2.0.2
-  - maven=3.9.6
-  - openjdk=11.0.13
-  - pandas=1.5.3
-  - pip=23.0.1
-  - pyarrow=10.0.1
-  - python=3.9
-  - python-confluent-kafka
-  - python-dotenv=0.21.0
-  - python-rapidjson=1.5
-  - snowflake-connector-python=3.15.0
-  - snowflake-ingest=1.0.10
-  - pip:
-      - optional-faker==2.1.0
-```
+## Setup
 
-Create and activate the environment:
+### 1. Snowflake
+
+Run `sql/setup_snowflake.sql` in your Snowflake account as `ACCOUNTADMIN`.  
+It creates: warehouse `FIGURINE_WH`, role `FIGURINE_ROLE`, database `FIGURINE_DB`, schema `FIGURINE_SCHEMA`, all tables, internal stages, and Snowpipe definitions.
+
+Generate an RSA key pair and link the public key to `FIGURINE_USER`:
 
 ```bash
-# Create environment
-conda env create -f environment.yml
-
-# Activate environment
-conda activate sf-ingest-examples
-```
-
-## 📊 Step 4: Create Data Generator
-
-Create `data_generator.py`:
-
-```python
-import sys
-import rapidjson as json
-import optional_faker as _
-import uuid
-import random
-
-from dotenv import load_dotenv
-from faker import Faker
-from datetime import date, datetime
-
-load_dotenv()
-fake = Faker()
-inventory = ["Kpop Demon Hunter T-Shirt", "Kpop Demon Hunter Hoodie", "Kpop Demon Hunter Poster", "Kpop Demon Hunter Keychain", 
-             "Kpop Demon Hunter Sticker Pack", "Kpop Demon Hunter Phone Case", "Kpop Demon Hunter Mug", "Kpop Demon Hunter Cap",
-             "Kpop Demon Hunter Tote Bag", "Kpop Demon Hunter Pin Set", "Kpop Demon Hunter Notebook", "Kpop Demon Hunter Lanyard",
-             "Kpop Demon Hunter Vinyl Record", "Kpop Demon Hunter CD", "Kpop Demon Hunter Figurine", "Kpop Demon Hunter Plushie",
-             "Kpop Demon Hunter Mousepad", "Kpop Demon Hunter Wallet", "Kpop Demon Hunter Backpack", "Kpop Demon Hunter Socks",
-             "Kpop Demon Hunter Bracelet", "Kpop Demon Hunter Necklace", "Kpop Demon Hunter Badge", "Kpop Demon Hunter Magnet",
-             "Kpop Demon Hunter Calendar", "Kpop Demon Hunter Pillow", "Kpop Demon Hunter Blanket", "Kpop Demon Hunter Tumbler"]    
-
-
-def print_client_support():
-    global inventory, fake
-    state = fake.state_abbr()
-    client_support = {'txid': str(uuid.uuid4()),
-                      'rfid': hex(random.getrandbits(96)),
-                      'item': fake.random_element(elements=inventory),
-                      'purchase_time': datetime.utcnow().isoformat(),
-                      'expiration_time': date(2023, 6, 1).isoformat(),
-                      'days': fake.random_int(min=1, max=7),
-                      'name': fake.name(),
-                      'address': fake.none_or({'street_address': fake.street_address(), 
-                                                'city': fake.city(), 'state': state, 
-                                                'postalcode': fake.postalcode_in_state(state)}),
-                      'phone': fake.none_or(fake.phone_number()),
-                      'email': fake.none_or(fake.email()),
-                      'emergency_contact' : fake.none_or({'name': fake.name(), 'phone': fake.phone_number()}),
-    }
-    d = json.dumps(client_support) + '\n'
-    sys.stdout.write(d)
-
-
-if __name__ == "__main__":
-    args = sys.argv[1:]
-    total_count = int(args[0])
-    for _ in range(total_count):
-        print_client_support()
-    print('')
-```
-
-Test the data generator:
-```bash
-python data_generator.py 1
-```
-
-Generate sample dataset:
-```bash
-python data_generator.py 100000 | gzip > data.json.gz
-```
-
-## ❄️ Step 5: Configure Snowflake
-
-### 5.1 Create Snowflake Resources
-
-Log into your Snowflake account and run these SQL commands:
-
-```sql
-USE ACCOUNTADMIN;
-
--- Create warehouse, role, and database
-CREATE WAREHOUSE IF NOT EXISTS INGEST;
-CREATE ROLE IF NOT EXISTS INGEST;
-GRANT USAGE ON WAREHOUSE INGEST TO ROLE INGEST;
-GRANT OPERATE ON WAREHOUSE INGEST TO ROLE INGEST;
-
-CREATE DATABASE IF NOT EXISTS INGEST;
-USE DATABASE INGEST;
-CREATE SCHEMA IF NOT EXISTS INGEST;
-USE SCHEMA INGEST;
-
-GRANT OWNERSHIP ON DATABASE INGEST TO ROLE INGEST;
-GRANT OWNERSHIP ON SCHEMA INGEST.INGEST TO ROLE INGEST;
-
--- Create user (replace YOUR_PASSWORD with a secure password)
-CREATE USER INGEST PASSWORD='YOUR_PASSWORD' LOGIN_NAME='INGEST' 
-    MUST_CHANGE_PASSWORD=FALSE, DISABLED=FALSE, 
-    DEFAULT_WAREHOUSE='INGEST', DEFAULT_NAMESPACE='INGEST.INGEST', 
-    DEFAULT_ROLE='INGEST';
-
-GRANT ROLE INGEST TO USER INGEST;
-
--- Grant yourself the INGEST role for management
-SET USERNAME=CURRENT_USER();
-GRANT ROLE INGEST TO USER IDENTIFIER($USERNAME);
-```
-
-### 5.2 Create the Table
-
-```sql
-USE ROLE INGEST;
-
--- Table for Kpop Demon Hunter merchandise orders
-CREATE OR REPLACE TABLE CLIENT_SUPPORT_ORDERS (
-    TXID VARCHAR(255) NOT NULL,
-    RFID VARCHAR(255) NOT NULL,  
-    ITEM VARCHAR(255) NOT NULL,
-    PURCHASE_TIME TIMESTAMP NOT NULL,
-    EXPIRATION_TIME DATE NOT NULL,
-    DAYS NUMBER NOT NULL,
-    NAME VARCHAR(255) NOT NULL,
-    ADDRESS VARIANT,                     
-    PHONE VARCHAR(255),                  
-    EMAIL VARCHAR(255),                  
-    EMERGENCY_CONTACT VARIANT,           
-    PRIMARY KEY (TXID)
-);
-
--- Add comments for clarity
-COMMENT ON TABLE CLIENT_SUPPORT_ORDERS IS 'Customer orders for Kpop Demon Hunter merchandise inventory';
-COMMENT ON COLUMN CLIENT_SUPPORT_ORDERS.ITEM IS 'Product from Kpop Demon Hunter merchandise inventory';
-COMMENT ON COLUMN CLIENT_SUPPORT_ORDERS.ADDRESS IS 'JSON: {street_address, city, state, postalcode} or NULL';
-COMMENT ON COLUMN CLIENT_SUPPORT_ORDERS.EMERGENCY_CONTACT IS 'JSON: {name, phone} or NULL';
-```
-
-## 🔐 Step 6: Generate RSA Key Pair
-
-### For Mac/Linux:
-```bash
-# Generate private key
-openssl genrsa 4096 | openssl pkcs8 -topk8 -inform PEM -out rsa_key.p8 -nocrypt
-
-# Extract public key
-openssl rsa -in rsa_key.p8 -pubout -out rsa_key.pub
-
-# Generate SQL command to set public key
-echo "ALTER USER INGEST SET RSA_PUBLIC_KEY='$(cat ./rsa_key.pub)';"
-```
-
-### For Windows:
-Option 1 - Using Windows Subsystem for Linux (WSL):
-```bash
-wsl
-# Then run the Mac/Linux commands above
-```
-
-Option 2 - Using Git Bash (if you have Git installed):
-```bash
-# Open Git Bash and run the Mac/Linux commands
-```
-
-Option 3 - Using PowerShell with OpenSSL:
-```powershell
-# Install OpenSSL for Windows first, then:
 openssl genrsa 4096 | openssl pkcs8 -topk8 -inform PEM -out rsa_key.p8 -nocrypt
 openssl rsa -in rsa_key.p8 -pubout -out rsa_key.pub
-Get-Content .\rsa_key.pub | Out-String | ForEach-Object { "ALTER USER INGEST SET RSA_PUBLIC_KEY='$($_.Trim())';" }
+# Copy the ALTER USER command from sql/setup_snowflake.sql and run it in Snowflake
 ```
 
-**Important**: Copy the output SQL command and run it in Snowflake to associate the public key with your user.
+### 2. Python environment
 
-### Extract Private Key for Application Use:
-
-### Mac/Linux:
 ```bash
-PRVK=$(cat ./rsa_key.p8 | grep -v KEY- | tr -d '\012')
-echo "PRIVATE_KEY=$PRVK"
+pip install -r requirements.txt
 ```
 
-### Windows (PowerShell):
-```powershell
-$PRVK = (Get-Content .\rsa_key.p8 | Where-Object { $_ -notmatch "KEY-" }) -join ""
-Write-Output "PRIVATE_KEY=$PRVK"
-```
+### 3. Environment variables
 
-## 🔧 Step 7: Create Environment File
-
-Create `.env` file with your credentials:
-
-```env
-SNOWFLAKE_ACCOUNT=YOUR_ACCOUNT_IDENTIFIER
-SNOWFLAKE_USER=INGEST
-PRIVATE_KEY=YOUR_PRIVATE_KEY_HERE
-```
-
-Replace:
-- `YOUR_ACCOUNT_IDENTIFIER`: Your Snowflake account identifier (format: `ORG-ACCOUNT`)
-- `YOUR_PRIVATE_KEY_HERE`: The private key string from Step 6
-
-### Secure the Environment File:
-
-### Mac/Linux:
 ```bash
-chmod 600 .env
+cp .env.example .env
+# Fill in SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD,
+# PRIVATE_KEY, and ANTHROPIC_API_KEY (see .env.example for details)
 ```
 
-### Windows:
-```powershell
-# Right-click .env file → Properties → Security → Advanced
-# Remove access for everyone except your user account
-```
+> **Two auth methods are used intentionally:**  
+> - `py_snowpipe_kscm.py` uses RSA key-pair auth (required by Snowpipe's JWT mechanism)  
+> - `streamkscm.py` uses password auth via SQLAlchemy (simpler for read-only queries)
 
-## 📝 Step 8: Create Python Insertion Script
+## Running the Pipeline
 
-Create `py_insert.py`:
+Open two terminals from the project root.
 
-```python
-import os, sys, logging
-import json
-import snowflake.connector
+**Terminal 1 — start the ingestor (waits for data on the queue):**
 
-from dotenv import load_dotenv
-from cryptography.hazmat.primitives import serialization
-
-load_dotenv()
-logging.basicConfig(level=logging.WARN)
-snowflake.connector.paramstyle='qmark'
-
-
-def connect_snow():
-    private_key = "-----BEGIN PRIVATE KEY-----\n" + os.getenv("PRIVATE_KEY") + "\n-----END PRIVATE KEY-----\n"
-    p_key = serialization.load_pem_private_key(
-        bytes(private_key, 'utf-8'),
-        password=None
-    )
-    pkb = p_key.private_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption())
-
-    return snowflake.connector.connect(
-        account=os.getenv("SNOWFLAKE_ACCOUNT"),
-        user=os.getenv("SNOWFLAKE_USER"),
-        private_key=pkb,
-        role="INGEST",
-        database="INGEST",
-        schema="INGEST",
-        warehouse="INGEST",
-        session_parameters={'QUERY_TAG': 'py-insert'}, 
-    )
-
-
-def save_to_snowflake(snow, message):
-    record = json.loads(message)
-    logging.debug('inserting record to db')
-    row = (record['txid'],record['rfid'],record["item"],record["purchase_time"],record["expiration_time"],record['days'],record['name'],json.dumps(record['address']),record['phone'],record['email'],json.dumps(record['emergency_contact']))
-    # this dataset has variant records, so utilizing an executemany() is not possible, must insert 1 record at a time
-    snow.cursor().execute("INSERT INTO CLIENT_SUPPORT_ORDERS (\"TXID\",\"RFID\",\"ITEM\",\"PURCHASE_TIME\", \"EXPIRATION_TIME\",\"DAYS\",\"NAME\",\"ADDRESS\",\"PHONE\",\"EMAIL\",\"EMERGENCY_CONTACT\") SELECT ?,?,?,?,?,?,?,PARSE_JSON(?),?,?,PARSE_JSON(?)", row)
-    logging.debug(f"inserted order {record}")
-
-
-if __name__ == "__main__":    
-    snow = connect_snow()
-    for message in sys.stdin:
-        if message != '\n':
-            save_to_snowflake(snow, message)
-        else:
-            break
-    snow.close()
-    logging.info("Ingest complete")
-```
-
-## 🛡️ Step 9: Create .gitignore
-
-Create `.gitignore` to protect sensitive files:
-
-```gitignore
-# Environment variables and credentials
-.env
-*.p8
-rsa_key.pub
-rsa_key.p8
-
-# Data files
-*.json.gz
-*.parquet
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Logs
-*.log
-```
-
-## 🧪 Step 10: Test the Pipeline
-
-### Ensure you're in the right environment:
 ```bash
-# Navigate to project directory
-cd path/to/your/snowflake-ingestion
-
-# Activate conda environment
-conda activate sf-ingest-examples
+export KAFKA_TOPIC="figurine_data_topic"
+python python/py_snowpipe_kscm.py
 ```
 
-### Test individual components:
+**Terminal 2 — generate and publish data:**
+
 ```bash
-# Test data generator
-python data_generator.py 1
-
-# Test connection (should show no errors)
-python -c "import py_insert; snow = py_insert.connect_snow(); print('✅ Connection successful!'); snow.close()"
+export KAFKA_TOPIC="figurine_data_topic"
+python python/data_generator_kscm.py 20000 753 | python python/simple_publish_data.py
+# args: <num_orders> <num_customers>
 ```
 
-### Test the full pipeline:
+The ingestor receives the JSON payload, flattens the nested `order_items`, converts each table to Parquet, uploads to the corresponding Snowflake internal stage, and triggers Snowpipe. Records appear in Snowflake within ~1 minute.
+
+## Dashboard
+
 ```bash
-# Test with 1 record
-python data_generator.py 1 | python py_insert.py
-
-# Test with 10 records
-python data_generator.py 10 | python py_insert.py
-
-# Load your full dataset (100K records)
-gunzip -c data.json.gz | python py_insert.py
+streamlit run python/streamkscm.py
 ```
 
-### Verify data in Snowflake:
+The dashboard connects to Snowflake and provides 9 tabs:
+
+| Tab | Content |
+|---|---|
+| Synthèse Exécutive | KPIs, revenue, top products |
+| Analyse des Ventes | Sales by channel, theme, finish |
+| Segmentation Client | RFM K-Means clustering (4 segments) |
+| Prévisions & Science des Données | SARIMA 30-day sales forecast |
+| Rétention & CLV | Cohort retention heatmap |
+| Chat Interactif IA | Natural language → SQL → results (Claude) |
+| Assistant Stratégique IA | C-level executive report generated by Claude |
+| Data Quality Monitoring | Null rates, duplicate detection, anomalies |
+| R&D Experimental | Market basket analysis, cross-sell opportunities |
+
+> **Anthropic API key:** set `ANTHROPIC_API_KEY` in `.env` before launching.  
+> If omitted, the dashboard will prompt for the key in the sidebar at runtime — AI tabs will not function without it.
+
+## Tests
+
+```bash
+pytest tests/ -v
+```
+
+Tests cover the data generator: product count and structure, customer uniqueness, order–customer–product referential integrity, status/channel validity.
+
+## Verify ingestion in Snowflake
+
 ```sql
-USE ROLE INGEST;
-USE DATABASE INGEST;
-USE SCHEMA INGEST;
+USE ROLE FIGURINE_ROLE;
+USE SCHEMA FIGURINE_DB.FIGURINE_SCHEMA;
 
--- Check row count
-SELECT COUNT(*) FROM CLIENT_SUPPORT_ORDERS;
+SELECT 'PRODUCTS', COUNT(*) FROM PRODUCTS
+UNION ALL SELECT 'CUSTOMERS', COUNT(*) FROM CUSTOMERS
+UNION ALL SELECT 'ORDERS', COUNT(*) FROM ORDERS
+UNION ALL SELECT 'ORDER_ITEMS', COUNT(*) FROM ORDER_ITEMS;
 
--- View sample records
-SELECT * FROM CLIENT_SUPPORT_ORDERS LIMIT 5;
-
--- Check data distribution by product
-SELECT ITEM, COUNT(*) as order_count 
-FROM CLIENT_SUPPORT_ORDERS 
-GROUP BY ITEM 
-ORDER BY order_count DESC;
+-- Snowpipe copy history (last hour)
+SELECT * FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(
+    TABLE_NAME => 'ORDERS',
+    START_TIME => DATEADD(hours, -1, CURRENT_TIMESTAMP())
+));
 ```
-
-## 🚨 Troubleshooting
-
-### Common Issues:
-
-**"command not found: python"**
-- Solution: Activate the conda environment: `conda activate sf-ingest-examples`
-
-**"JWT token is invalid"**
-- Solution: Ensure you've run the `ALTER USER INGEST SET RSA_PUBLIC_KEY=...` command in Snowflake
-
-**"Permission denied"**
-- Solution: Check that your Snowflake user has the INGEST role and proper permissions
-
-**"File not found"**
-- Solution: Ensure you're in the correct project directory
-
-**Connection timeout**
-- Solution: Check your Snowflake account identifier format and network connectivity
-
-## 📁 Final Project Structure
-
-```
-snowflake-ingestion/
-├── .env                    # Snowflake credentials (keep secure!)
-├── .gitignore             # Protects sensitive files
-├── environment.yml        # Conda environment setup
-├── data_generator.py      # Generates sample data
-├── py_insert.py          # Inserts data to Snowflake  
-├── data.json.gz          # Sample dataset (100K records)
-├── rsa_key.p8            # Private key (keep secure!)
-├── rsa_key.pub           # Public key
-└── README.md             # This guide
-```
-
-## 🎉 Success!
-
-You now have a complete Snowflake data ingestion pipeline that can:
-- Generate realistic e-commerce data
-- Securely connect to Snowflake using key pair authentication
-- Stream process data directly into Snowflake tables
-- Handle JSON variant data types
-- Scale to process large datasets
-
-## 🔗 Next Steps
-
-- Explore Snowflake's Snowpipe for real-time ingestion
-- Add data quality validation
-- Implement error handling and retry logic
-- Set up monitoring and alerting
-- Create data transformation pipelines with dbt
-
----
-
-**Security Reminder**: Always protect your `.env` file, private keys, and never commit them to version control!
-# etl_and_warehousing_with_snowflake
